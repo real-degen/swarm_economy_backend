@@ -135,20 +135,23 @@ def simulate_explorer(agent):
             agent["resources"] = 0
 
 def simulate_turn():
-    """Simulate one turn of the simulation."""
     global SWT_VALUE
+    
+    # Ensure all agents have the 'type' key initialized before interactions
     for agent_type, agents in AGENTS.items():
         for agent in agents:
-            agent["type"] = agent_type  # Add type for interactions
+            agent["type"] = agent_type  # Initialize type for all agents
+
+    # Simulate interactions
+    for agent_type, agents in AGENTS.items():
+        for agent in agents:
             if agent_type == "explorers":
                 simulate_explorer(agent)
             else:
-                # Select a random other agent to interact with
                 other_agent_type = random.choice(list(AGENTS.keys()))
                 other_agent = random.choice(AGENTS[other_agent_type])
                 simulate_interaction(agent, other_agent)
 
-    # Adjust SWT value based on total resources
     total_swt = sum(agent["swt"] for agents in AGENTS.values() for agent in agents)
     SWT_VALUE = max(0.0000001, TOTAL_RESOURCES / total_swt)
 
@@ -161,8 +164,14 @@ def simulation_loop():
 threading.Thread(target=simulation_loop, daemon=True).start()
 
 # API routes
-@app.route("/api/status", methods=["GET"])
-def get_status():
+# Add a default route for '/'
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"message": "Welcome to the Simulation API!"})
+
+# Add a route for `/simulation-data`
+@app.route("/simulation-data", methods=["GET"])
+def simulation_data():
     return jsonify({
         "total_resources": TOTAL_RESOURCES,
         "swt_value": SWT_VALUE,
