@@ -1,73 +1,180 @@
 from flask import Flask, jsonify, request
-from flask_cors import CORS
 import random
-import os
 import threading
 import time
 
 app = Flask(__name__)
-CORS(app)  # Allow all origins to access this backend
 
-# Simulation Data
-total_resources = 1_000_000_000
-token_value = 0.000005
-agents = [{"id": i, "tokens": random.randint(100, 500), "role": random.choice(["Producer", "Consumer"]), 
-           "position": {"x": random.randint(0, 500), "y": random.randint(0, 500)}}
-          for i in range(100)]
+# Initialize simulation parameters
+TOTAL_RESOURCES = 1_000_000
+SWT_VALUE = 0.000005
+GAS_COST = 0.000001  # SWT burned per agent per interaction
+EXPLORER_RESOURCE_CUTOFF = 50  # Minimum resources needed for explorers to sell
 
-# Simulate Interactions
-def simulate_interactions():
-    global total_resources, token_value, agents
+# Initialize agent groups
+AGENTS = {
+    "traders": [{"id": i, "swt": random.randint(50, 100), "resources": random.randint(20, 50), "position": [random.randint(0, 100), random.randint(0, 100)], "alliance": None, "history": []} for i in range(1, 44)],
+    "consumers": [{"id": i, "swt": random.randint(20, 50), "resources": random.randint(50, 100), "position": [random.randint(0, 100), random.randint(0, 100)], "alliance": None, "history": []} for i in range(44, 76)],
+    "producers": [{"id": i, "swt": random.randint(30, 70), "resources": random.randint(0, 20), "position": [random.randint(0, 100), random.randint(0, 100)], "alliance": None, "history": []} for i in range(76, 100)],
+    "governors": [{"id": i, "swt": random.randint(500, 1000), "resources": random.randint(0, 10), "position": [random.randint(0, 100), random.randint(0, 100)], "alliance": None, "history": []} for i in range(100, 112)],
+    "explorers": [{"id": i, "swt": random.randint(5, 15), "resources": random.randint(0, 5), "position": [random.randint(0, 100), random.randint(0, 100)], "alliance": None, "history": []} for i in range(112, 118)],
+}
 
-    # Adjust resources and token value
-    total_tokens = sum(agent["tokens"] for agent in agents)
-    if total_tokens == 0:  # Prevent division by zero
-        total_tokens = 1
+# Initialize resource locations on the heatmap
+RESOURCE_LOCATIONS = [{"position": [random.randint(0, 100), random.randint(0, 100)], "size": random.randint(10, 50)} for _ in range(20)]
 
-    token_value = max(0.0000001, total_resources / total_tokens)
+# Alliance data structure
+ALLIANCES = []
 
-    for agent in agents:
-        if agent["role"] == "Producer":
-            agent["tokens"] += random.randint(10, 50)  # Producers earn tokens
-        elif agent["role"] == "Consumer":
-            agent["tokens"] -= random.randint(5, 30)  # Consumers spend tokens
-            if agent["tokens"] < 0:
-                agent["tokens"] = 0  # Prevent negative tokens
+# Helper functions
+def calculate_distance(pos1, pos2):
+    return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
 
-        # Update positions (random movement for heatmap)
-        agent["position"]["x"] = (agent["position"]["x"] + random.randint(-10, 10)) % 500
-        agent["position"]["y"] = (agent["position"]["y"] + random.randint(-10, 10)) % 500
+def find_nearest_agent(agent, agent_type):
+    agents = AGENTS[agent_type]
+    distances = [(other_agent, calculate_distance(agent["position"], other_agent["position"])) for other_agent in agents]
+    return min(distances, key=lambda x: x[1])[0] if distances else None
 
-    # End simulation if resources or tokens run out
-    if any(agent["tokens"] == 0 for agent in agents):
-        print("Simulation ended: An agent has run out of tokens.")
-        exit()
+def form_alliance(agent1, agent2):
+    """Form an alliance between two agents."""
+    if agent1["alliance"] is None and agent2["alliance"] is None:
+        # Create a new alliance
+        new_alliance = [agent1, agent2]
+        ALLIANCES.append(new_alliance)
+        agent1["alliance"] = new_alliance
+        agent2["alliance"] = new_alliance
+    elif agent1["alliance"] is None:
+        # Add agent1 to agent2's alliance
+        agent1["alliance"] = agent2["alliance"]
+        agent2["alliance"].append(agent1)
+    elif agent2["alliance"] is None:
+        # Add agent2 to agent1's alliance
+        agent2["alliance"] = agent1["alliance"]
+        agent1["alliance"].append(agent2)
 
-# Background Simulation Loop
+def break_alliance(agent1, agent2):
+    """Break an alliance between two agents."""
+    if agent1["alliance"] and agent2["alliance"] and agent1["alliance"] == agent2["alliance"]:
+        alliance = agent1["alliance"]
+        alliance.remove(agent1)
+        alliance.remove(agent2)
+        agent1["alliance"] = None
+        agent2["alliance"] = None
+        if len(alliance) < 2:
+            ALLIANCES.remove(alliance)
+
+def evaluate_alliance(agent1, agent2):
+    """Determine if an alliance should form, persist, or break."""
+    # Form alliance if both agents trade frequently and history shows trust
+    if len(agent1["history"]) > 3 and len(agent2["history"]) > 3:
+        if agent2["id"] in [entry["id"] for entry in agent1["history"] if entry["action"] == "trade"]:
+            form_alliance(agent1, agent2)
+    # Break alliance if cheating occurs
+    if agent2["id"] in [entry["id"] for entry in agent1["history"] if entry["action"] == "cheat"]:
+        break_alliance(agent1, agent2)
+
+def simulate_interaction(agent1, agent2):
+    """Simulate interactions between agents, burning SWT as gas."""
+    global SWT_VALUE
+    agent1["swt"] -= GAS_COST
+    agent2["swt"] -= GAS_COST
+
+    better_rate = 0.8  # Better rate for alliance members
+    worse_rate = 1.2  # Worse rate for non-alliance members
+    rate = 1.0
+
+    # Determine rate based on alliance
+    if agent1["alliance"] == agent2["alliance"] and agent1["alliance"] is not None:
+        rate = better_rate
+    elif agent1["alliance"] is not None or agent2["alliance"] is not None:
+        rate = worse_rate
+
+    # Traders
+    if "traders" in [agent1["type"], agent2["type"]]:
+        trade_amount = random.randint(1, 10)
+        if random.choice([True, False]):
+            agent1["swt"] -= trade_amount * rate
+            agent2["swt"] += trade_amount * rate
+            agent1["history"].append({"id": agent2["id"], "action": "trade"})
+        else:
+            agent1["resources"] -= trade_amount * rate
+            agent2["resources"] += trade_amount * rate
+
+    # Producers and Consumers
+    if "producers" in [agent1["type"], agent2["type"]] and "consumers" in [agent1["type"], agent2["type"]]:
+        trade_amount = random.randint(5, 15)
+        producer = agent1 if agent1["type"] == "producers" else agent2
+        consumer = agent1 if agent1["type"] == "consumers" else agent2
+        producer["resources"] -= trade_amount * rate
+        consumer["resources"] += trade_amount * rate
+        consumer["swt"] -= trade_amount * SWT_VALUE * rate
+        producer["swt"] += trade_amount * SWT_VALUE * rate
+        producer["history"].append({"id": consumer["id"], "action": "trade"})
+
+    # Evaluate alliance potential
+    evaluate_alliance(agent1, agent2)
+
+def simulate_explorer(agent):
+    """Simulate explorer's behavior."""
+    agent["swt"] -= GAS_COST  # Burn SWT for moving
+    agent["position"] = [random.randint(0, 100), random.randint(0, 100)]  # Move randomly
+    for resource in RESOURCE_LOCATIONS:
+        if calculate_distance(agent["position"], resource["position"]) < 5:
+            # Explorer collects resource
+            agent["resources"] += resource["size"]
+            RESOURCE_LOCATIONS.remove(resource)
+            break
+
+    # If explorer reaches cutoff, sell resources
+    if agent["resources"] >= EXPLORER_RESOURCE_CUTOFF:
+        nearest_consumer = find_nearest_agent(agent, "consumers")
+        if nearest_consumer:
+            nearest_consumer["resources"] += agent["resources"]
+            nearest_consumer["swt"] -= agent["resources"] * SWT_VALUE
+            agent["swt"] += agent["resources"] * SWT_VALUE
+            agent["resources"] = 0
+
+def simulate_turn():
+    """Simulate one turn of the simulation."""
+    global SWT_VALUE
+    for agent_type, agents in AGENTS.items():
+        for agent in agents:
+            agent["type"] = agent_type  # Add type for interactions
+            if agent_type == "explorers":
+                simulate_explorer(agent)
+            else:
+                # Select a random other agent to interact with
+                other_agent_type = random.choice(list(AGENTS.keys()))
+                other_agent = random.choice(AGENTS[other_agent_type])
+                simulate_interaction(agent, other_agent)
+
+    # Adjust SWT value based on total resources
+    total_swt = sum(agent["swt"] for agents in AGENTS.values() for agent in agents)
+    SWT_VALUE = max(0.0000001, TOTAL_RESOURCES / total_swt)
+
+# Background thread for simulation
 def simulation_loop():
     while True:
-        simulate_interactions()
-        time.sleep(2)  # Run the simulation every 2 seconds
+        simulate_turn()
+        time.sleep(1)  # Adjust speed of simulation
 
-# Start the background thread
 threading.Thread(target=simulation_loop, daemon=True).start()
 
-# Routes
-@app.route("/simulation-data", methods=["GET"])
-def get_simulation_data():
-    global total_resources, token_value, agents
+# API routes
+@app.route("/api/status", methods=["GET"])
+def get_status():
     return jsonify({
-        "total_resources": total_resources,
-        "token_value": token_value,
-        "agents": agents
+        "total_resources": TOTAL_RESOURCES,
+        "swt_value": SWT_VALUE,
+        "agents": AGENTS,
+        "alliances": ALLIANCES,
+        "resource_locations": RESOURCE_LOCATIONS,
     })
 
-@app.route("/simulate", methods=["POST"])
+@app.route("/api/simulate", methods=["POST"])
 def simulate_step():
-    simulate_interactions()
-    return jsonify({"message": "Next step simulated."})
+    simulate_turn()
+    return jsonify({"message": "Simulation step completed."})
 
-# Entry Point
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Use dynamic port for Render
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=5000)
